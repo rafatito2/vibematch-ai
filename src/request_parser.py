@@ -235,5 +235,6 @@ def parse_request(request: str, songs: List[Dict], llm=None, few_shot: bool = Tr
         except Exception as exc:
             log.warning("parser: llm failed, using keywords: %s", exc)
     prefs, confidence, notes = keyword_parse(request, vocab)
+    prefs, confidence = cross_check_energy(request, prefs, confidence, notes)
     log.info("parser: keyword prefs=%s", prefs)
     return prefs, confidence, notes, "keywords"
