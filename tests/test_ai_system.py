@@ -7,7 +7,9 @@ from src.guardrails import check_explanation, check_request, template_explanatio
 from src.knowledge import load_genre_notes, notes_for_songs
 from src.llm import LLMError, ScriptedLLM
 from src.recommender import load_songs
-from src.request_parser import catalog_vocab, extract_json, keyword_parse, parse_request, validate_profile
+from src.request_parser import (
+    catalog_vocab, cross_check_energy, extract_json, keyword_parse, parse_request, validate_profile,
+)
 
 SONGS = load_songs("data/songs.csv")
 VOCAB = catalog_vocab(SONGS)
@@ -66,6 +68,19 @@ def test_keyword_parse_finds_activity_and_named_genre():
 def test_parse_request_falls_back_to_keywords_when_model_fails():
     prefs, _, _, source = parse_request("music for the gym", SONGS, ScriptedLLM([LLMError("503")]))
     assert source == "keywords" and prefs["mood"] == "intense"
+
+
+def test_unavailable_genre_is_reported_and_lowers_confidence():
+    prefs, confidence, notes = validate_profile(
+        {"genre": "pop", "unavailable": "k-pop", "energy": 0.8, "confidence": 0.8}, VOCAB)
+    assert prefs["genre"] == "pop"
+    assert any("no k-pop" in n for n in notes) and confidence < 0.8
+
+
+def test_cross_check_fixes_energy_that_contradicts_the_request():
+    notes = []
+    prefs, confidence = cross_check_energy("sad songs but super high energy", {"energy": 0.3}, 0.8, notes)
+    assert prefs["energy"] == 0.85 and confidence == 0.6 and notes
 
 
 # --- guardrails ---
@@ -143,4 +158,6 @@ def test_agent_never_recommends_explicit_songs_for_clean_requests():
 def test_agent_flags_low_confidence_when_nothing_matches():
     agent = make_agent([profile_reply(mood="sad", energy=0.95, confidence=0.3), LLMError("down")])
     result = agent.run("sad but super high energy")
-    assert result["confidence"] < 0.45 and result["warnings"]
+    assert result["confidence"] < 0.45
+    assert any("Low confidence" in w for w in result["warnings"])
+    assert any("No song fully matches" in w for w in result["warnings"])

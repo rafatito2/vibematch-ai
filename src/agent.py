@@ -37,7 +37,19 @@ def setup_logging(log_dir: str = "logs") -> None:
     )
 
 
-def build_explain_prompt(request: str, results, notes: Dict[str, str], problems: Optional[List[str]] = None) -> str:
+def missed_fields(prefs: Dict, top: Dict) -> List[str]:
+    """Which asked-for genre, mood or energy the top pick does NOT satisfy."""
+    missed = []
+    for key in ("genre", "mood"):
+        if key in prefs and top.get(key, "").lower() != prefs[key]:
+            missed.append(f"{key} '{prefs[key]}'")
+    if "energy" in prefs and abs(top.get("energy", 0.0) - prefs["energy"]) > 0.2:
+        missed.append(f"energy {prefs['energy']}")
+    return missed
+
+
+def build_explain_prompt(request: str, results, notes: Dict[str, str], problems: Optional[List[str]] = None,
+                         missed: Optional[List[str]] = None) -> str:
     """Prompt for the explanation. The model sees only the picked songs and their genre notes."""
     lines = [
         "You are VibeMatch, a music assistant. Explain to the listener why these songs fit their request.",
@@ -54,6 +66,10 @@ def build_explain_prompt(request: str, results, notes: Dict[str, str], problems:
     lines.append("Genre notes:")
     for genre, note in notes.items():
         lines.append(f"- {genre}: {note}")
+    if missed:
+        lines.append("")
+        lines.append(f"Important: the top song does not match the requested {', '.join(missed)}. "
+                     "The catalog has no song that fits everything. Say this plainly in your first sentence.")
     lines += [
         "",
         "Rules:",
@@ -101,8 +117,9 @@ class VibeMatchAgent:
             return self._finish(request, trace, status="refused",
                                 message="That doesn't look like a music request, so I won't guess a playlist.")
         if not any(key in prefs for key in ("genre", "mood", "energy")):
-            return self._finish(request, trace, status="refused",
-                                message="I couldn't tell what kind of music you want. Try naming an activity, mood or genre.")
+            return self._finish(
+                request, trace, status="refused",
+                message="I couldn't tell what kind of music you want. Try naming an activity, mood or genre.")
 
         # Guardrail: "clean" is a hard rule, not a score penalty. The Project 3 penalty
         # still let an explicit song into the top 3 when it matched genre and mood.
@@ -120,17 +137,20 @@ class VibeMatchAgent:
         step("retrieve_notes", genres=list(genre_notes))
 
         confidence = self._confidence(prefs, parse_conf, picks)
-        step("confidence", value=confidence)
+        missed = missed_fields(prefs, picks[0]) if picks else []
+        step("confidence", value=confidence, top_pick_misses=missed)
 
-        explanation, explained_by = self._explain(request, results, genre_notes, step)
+        explanation, explained_by = self._explain(request, results, genre_notes, step, missed)
         warnings = []
+        if missed:
+            warnings.append(f"No song fully matches: the top pick misses the requested {', '.join(missed)}.")
         if confidence < LOW_CONFIDENCE:
             warnings.append("Low confidence: the catalog has no close match for this request.")
         return self._finish(request, trace, status="ok", prefs=prefs, results=results,
                             explanation=explanation, explained_by=explained_by,
                             confidence=confidence, warnings=warnings, parse_notes=notes)
 
-    def _explain(self, request, results, genre_notes, step):
+    def _explain(self, request, results, genre_notes, step, missed=None):
         """Draft, check, revise once, then fall back to the template."""
         if self.llm is None:
             step("draft", skipped="no model (offline)")
@@ -139,7 +159,8 @@ class VibeMatchAgent:
         problems = None
         for attempt in (1, 2):
             try:
-                draft = self.llm.generate(build_explain_prompt(request, results, genre_notes, problems), temperature=0.4)
+                prompt = build_explain_prompt(request, results, genre_notes, problems, missed)
+                draft = self.llm.generate(prompt, temperature=0.4)
             except Exception as exc:
                 step("draft", attempt=attempt, error=str(exc)[:120])
                 break
@@ -155,13 +176,7 @@ class VibeMatchAgent:
         """Mix of how sure the parser was and whether the top song matches the asked genre, mood and energy."""
         top = picks[0] if picks else {}
         asked = [key for key in ("genre", "mood", "energy") if key in prefs]
-        matched = 0
-        for key in asked:
-            if key == "energy":
-                matched += abs(top.get("energy", 0.0) - prefs["energy"]) <= 0.2
-            else:
-                matched += top.get(key, "").lower() == prefs[key]
-        match_share = matched / len(asked) if asked else 0.5
+        match_share = 1 - len(missed_fields(prefs, top)) / len(asked) if asked else 0.5
         return round(0.6 * parse_conf + 0.4 * match_share, 2)
 
     def _finish(self, request: str, trace: List[Dict], **result) -> Dict:
