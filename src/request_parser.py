@@ -16,25 +16,37 @@ FEW_SHOT_EXAMPLES = [
         "something calm to read with, no lyrics",
         {"genre": "classical", "mood": "peaceful", "energy": 0.2, "likes_acoustic": True,
          "target_instrumentalness": 0.9, "mood_tags": ["tender", "spacious"],
-         "allow_explicit": None, "off_topic": False, "confidence": 0.85},
+         "allow_explicit": None, "unavailable": None, "off_topic": False, "confidence": 0.85},
     ),
     (
         "hype me up for leg day, nothing explicit, my kid is in the car",
         {"genre": "pop", "mood": "intense", "energy": 0.92, "likes_acoustic": False,
          "target_instrumentalness": None, "mood_tags": ["driving"],
-         "allow_explicit": False, "off_topic": False, "confidence": 0.8},
+         "allow_explicit": False, "unavailable": None, "off_topic": False, "confidence": 0.8},
     ),
     (
         "rainy sunday, feeling a bit down",
         {"genre": "folk", "mood": "melancholy", "energy": 0.3, "likes_acoustic": True,
          "target_instrumentalness": None, "mood_tags": ["tender", "dark"],
-         "allow_explicit": None, "off_topic": False, "confidence": 0.7},
+         "allow_explicit": None, "unavailable": None, "off_topic": False, "confidence": 0.7},
+    ),
+    (
+        "upbeat stuff while I cook",
+        {"genre": None, "mood": "happy", "energy": 0.7, "likes_acoustic": None,
+         "target_instrumentalness": None, "mood_tags": ["bright"],
+         "allow_explicit": None, "unavailable": None, "off_topic": False, "confidence": 0.6},
+    ),
+    (
+        "some j-rock for my run",
+        {"genre": "rock", "mood": "intense", "energy": 0.9, "likes_acoustic": None,
+         "target_instrumentalness": None, "mood_tags": ["driving"],
+         "allow_explicit": None, "unavailable": "j-rock", "off_topic": False, "confidence": 0.6},
     ),
     (
         "what's the capital of France?",
         {"genre": None, "mood": None, "energy": None, "likes_acoustic": None,
          "target_instrumentalness": None, "mood_tags": [],
-         "allow_explicit": None, "off_topic": True, "confidence": 0.95},
+         "allow_explicit": None, "unavailable": None, "off_topic": True, "confidence": 0.95},
     ),
 ]
 
@@ -49,7 +61,11 @@ def build_prompt(request: str, vocab: Dict[str, List[str]], few_shot: bool = Tru
         "Fields: genre, mood, energy (0.0 to 1.0), likes_acoustic (true/false/null),",
         "target_instrumentalness (0.0 to 1.0 or null), mood_tags (list), allow_explicit",
         "(false only if the user asks for clean music, otherwise null), off_topic (true if the",
-        "request is not about music), confidence (0.0 to 1.0, how sure you are).",
+        "request is not about music), unavailable (anything the user asked for that is not in",
+        "the allowed lists, e.g. a genre the catalog lacks, otherwise null), confidence (0.0 to",
+        "1.0, how sure you are).",
+        "Leave genre null unless the user names a genre or the activity clearly calls for one.",
+        "If the user states an energy level, keep it even when it seems to clash with the mood.",
         "Only use values from the allowed lists. Reply with the JSON object only.",
     ]
     if few_shot:
@@ -128,6 +144,10 @@ def validate_profile(raw: Dict, vocab: Dict[str, List[str]]) -> Tuple[Dict, floa
         confidence = 0.5
     confidence = min(1.0, max(0.0, float(confidence)))
 
+    missing = raw.get("unavailable")
+    if isinstance(missing, str) and missing.strip():
+        notes.append(f"the catalog has no {missing.strip()}; showing the closest matches")
+
     # Every dropped field means the model guessed outside the catalog: trust it less.
     confidence = max(0.0, confidence - 0.15 * len(notes))
     if raw.get("off_topic") is True:
@@ -173,6 +193,31 @@ def keyword_parse(request: str, vocab: Dict[str, List[str]]) -> Tuple[Dict, floa
     return prefs, 0.5, []
 
 
+HIGH_ENERGY_WORDS = ("high energy", "high-energy", "energetic", "hype", "fast", "intense", "pump")
+LOW_ENERGY_WORDS = ("low energy", "low-energy", "calm", "slow", "quiet", "sleep", "soft")
+
+
+def cross_check_energy(request: str, prefs: Dict, confidence: float, notes: List[str]):
+    """Overrides the parsed energy when it contradicts energy words in the request itself.
+
+    Found in testing: for "sad songs but with super high energy" the few-shot model copied
+    the low energy from the "rainy sunday" example and returned 0.3.
+    """
+    text = request.lower()
+    energy = prefs.get("energy")
+    if energy is None:
+        return prefs, confidence
+    if any(w in text for w in HIGH_ENERGY_WORDS) and energy < 0.6:
+        notes.append(f"request asks for high energy but the profile had {energy}; using 0.85")
+        prefs["energy"] = 0.85
+        confidence = max(0.0, confidence - 0.2)
+    elif any(w in text for w in LOW_ENERGY_WORDS) and energy > 0.6:
+        notes.append(f"request asks for low energy but the profile had {energy}; using 0.3")
+        prefs["energy"] = 0.3
+        confidence = max(0.0, confidence - 0.2)
+    return prefs, round(confidence, 2)
+
+
 def parse_request(request: str, songs: List[Dict], llm=None, few_shot: bool = True):
     """Returns (prefs, confidence, notes, source). source is 'llm' or 'keywords'."""
     vocab = catalog_vocab(songs)
@@ -184,6 +229,7 @@ def parse_request(request: str, songs: List[Dict], llm=None, few_shot: bool = Tr
                 log.warning("parser: reply was not JSON: %r", reply[:120])
             else:
                 prefs, confidence, notes = validate_profile(raw, vocab)
+                prefs, confidence = cross_check_energy(request, prefs, confidence, notes)
                 log.info("parser: llm prefs=%s confidence=%.2f notes=%s", prefs, confidence, notes)
                 return prefs, confidence, notes, "llm"
         except Exception as exc:
