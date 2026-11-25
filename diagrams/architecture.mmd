@@ -1,0 +1,36 @@
+%% VibeMatch AI architecture. Matches src/agent.py step by step.
+flowchart TD
+    U([User request<br/>e.g. something chill to study to]) --> G1{check_request<br/>guardrails.py}
+    G1 -- empty / too long / injection --> R1[Refuse with reason]
+
+    G1 -- ok --> P[parse_request<br/>request_parser.py]
+    LLM[(Gemini<br/>llm.py<br/>retry + fallback model)] -. few-shot JSON profile .-> P
+    P -- API down / 429 --> KW[Keyword parser<br/>offline fallback]
+    KW --> V
+    P --> V[validate_profile<br/>drop values not in catalog<br/>report what the catalog lacks<br/>cross-check energy words]
+
+    V -- off-topic or empty profile --> R2[Refuse: not a music request]
+    V -- profile --> F[Clean filter<br/>remove explicit songs if asked]
+
+    CSV[(data/songs.csv<br/>20 songs)] --> F
+    F --> S[recommend_songs<br/>Project 3 scorer + diversity penalty<br/>RETRIEVE songs]
+    S --> N[notes_for_songs<br/>RETRIEVE genre notes]
+    NOTES[(data/genre_notes.md)] --> N
+
+    S --> C[Confidence + mismatch check<br/>does the top pick meet genre, mood, energy?]
+    N --> D[Draft explanation<br/>Gemini sees ONLY picked songs + notes]
+    C --> D
+    LLM -.-> D
+
+    D --> K{check_explanation<br/>invented song? unpicked song?<br/>no pick named? too long?}
+    K -- fails, 1st time --> D
+    K -- fails twice / model down --> T[Template explanation<br/>from scorer reasons]
+    K -- passes --> O([Output: table, explanation,<br/>confidence, warnings])
+    T --> O
+
+    O --> LOG[(logs/vibematch.log<br/>logs/traces.jsonl)]
+    O --> H{{Human check:<br/>listener reads warnings<br/>developer reviews traces}}
+
+    E[src/evaluate.py<br/>12 fixed cases, pass/fail,<br/>few-shot vs zero-shot] --> U
+    PYT[pytest: 32 tests<br/>scripted fake model] -.-> P
+    PYT -.-> K
